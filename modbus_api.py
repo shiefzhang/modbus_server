@@ -97,7 +97,9 @@ rate_limit_hits: Dict[str, deque] = {}
 # 统计信息
 stats = {
     "heartbeat_received": 0,
+    "command_echo_received": 0,
     "commands_sent": 0,
+    "last_command_echo": None,
     "last_heartbeat": None,
     "last_command": None,
     "active_connections": 0,
@@ -141,6 +143,20 @@ def extract_device_identifier(data: bytes) -> Optional[str]:
 
     return data[3:11].hex().upper()
 
+def build_command_frame(command: int) -> bytes:
+    """构建带 CRC 的完整 Modbus 命令帧。"""
+    command_frame = MODBUS_COMMANDS[command]
+    crc = calculate_crc16(command_frame)
+    return command_frame + struct.pack('<H', crc)
+
+def match_command_echo(data: bytes) -> Optional[int]:
+    """识别设备直接返回的命令回显帧。"""
+    for command in MODBUS_COMMANDS:
+        if data == build_command_frame(command):
+            return command
+
+    return None
+
 def send_command_to_client(client_socket: socket.socket, command: int, client_id: str) -> bool:
     """
     通过指定的客户端连接发送 Modbus 命令
@@ -157,31 +173,13 @@ def send_command_to_client(client_socket: socket.socket, command: int, client_id
         logger.error(f"不支持的命令: {command}")
         return False
     
-    command_frame = MODBUS_COMMANDS[command]
-    
-    # 计算 CRC 并附加到命令帧末尾
-    crc = calculate_crc16(command_frame)
-    command_frame += struct.pack('<H', crc)
+    command_frame = build_command_frame(command)
     
     try:
         # 通过现有的连接发送命令
         client_socket.send(command_frame)
         logger.info(f"✅ 通过连接 {client_id} 发送命令 {command}: {command_frame.hex().upper()}")
-        
-        # 可选：等待响应（如果需要）
-        try:
-            client_socket.settimeout(2)
-            response = client_socket.recv(1024)
-            if response:
-                logger.info(f"收到命令响应: {truncate_hex(response)}")
-        except socket.timeout:
-            logger.info("命令发送后无响应（超时）")
-        except Exception as e:
-            logger.info(f"接收响应时出错: {e}")
-        
-        # 恢复超时设置
-        client_socket.settimeout(60)
-        
+
         # 更新统计
         stats["commands_sent"] += 1
         stats["last_command"] = {
@@ -245,6 +243,14 @@ def get_client_by_device_identifier(device_identifier: str):
 
     return matched_client_id, matched_client_info, "device_identifier"
 
+def remove_device_identifier_mapping(device_identifier: Optional[str], client_id: str) -> None:
+    """移除仍指向指定连接的设备标识映射。调用方需要持有 clients_lock。"""
+    if (
+        device_identifier and
+        stats["device_identifiers"].get(device_identifier, {}).get("client_id") == client_id
+    ):
+        del stats["device_identifiers"][device_identifier]
+
 # ============ Modbus 心跳服务器 ============
 class ModbusHeartbeatServer:
     """Modbus 心跳服务器 - 维护客户端连接，接收心跳不回复"""
@@ -287,6 +293,19 @@ class ModbusHeartbeatServer:
                         break
                     
                     data_hex = truncate_hex(data)
+                    echoed_command = match_command_echo(data)
+                    if echoed_command is not None:
+                        logger.info(f"↩️ 收到命令回显 [{client_id}] 命令 {echoed_command}: {data_hex}")
+                        with clients_lock:
+                            stats["command_echo_received"] += 1
+                            stats["last_command_echo"] = {
+                                "command": echoed_command,
+                                "frame": data_hex,
+                                "client_id": client_id,
+                                "time": datetime.now().isoformat()
+                            }
+                        continue
+
                     logger.info(f"💓 收到心跳 [{client_id}]: {data_hex}")
 
                     if not validate_modbus_frame(data):
@@ -299,8 +318,25 @@ class ModbusHeartbeatServer:
                     device_identifier = extract_device_identifier(data)
 
                     # 只统计通过 CRC 校验的心跳，避免伪造帧更新在线设备状态。
+                    stale_socket = None
+                    stale_client_id = None
                     with clients_lock:
                         if client_id in active_clients:
+                            previous_identifier = active_clients[client_id].get("device_identifier")
+                            if previous_identifier != device_identifier:
+                                remove_device_identifier_mapping(previous_identifier, client_id)
+
+                            if device_identifier:
+                                existing_client_id = stats["device_identifiers"].get(
+                                    device_identifier, {}
+                                ).get("client_id")
+                                if existing_client_id and existing_client_id != client_id:
+                                    stale_client = active_clients.pop(existing_client_id, None)
+                                    if stale_client:
+                                        stale_socket = stale_client.get("socket")
+                                        stale_client_id = existing_client_id
+                                        stats["active_connections"] = len(active_clients)
+
                             active_clients[client_id]["last_heartbeat"] = heartbeat_time
                             active_clients[client_id]["heartbeat_count"] += 1
                             active_clients[client_id]["device_identifier"] = device_identifier
@@ -321,6 +357,15 @@ class ModbusHeartbeatServer:
                                 "from": f"{client_address[0]}:{client_address[1]}"
                             }
 
+                    if stale_socket:
+                        logger.info(
+                            f"设备标识 {device_identifier} 已由 {client_id} 接管，关闭旧连接 {stale_client_id}"
+                        )
+                        try:
+                            stale_socket.close()
+                        except Exception as e:
+                            logger.warning(f"关闭旧连接 {stale_client_id} 时出错: {e}")
+
                     # ⚠️ 关键：不发送任何回复
                     # 保持连接打开，等待后续命令
                     
@@ -338,11 +383,7 @@ class ModbusHeartbeatServer:
                 if client_id in active_clients:
                     device_identifier = active_clients[client_id].get("device_identifier")
                     del active_clients[client_id]
-                    if (
-                        device_identifier and
-                        stats["device_identifiers"].get(device_identifier, {}).get("client_id") == client_id
-                    ):
-                        del stats["device_identifiers"][device_identifier]
+                    remove_device_identifier_mapping(device_identifier, client_id)
                     stats["active_connections"] = len(active_clients)
             client_socket.close()
             logger.info(f"设备断开连接 [{client_id}]: {client_address}")
@@ -590,15 +631,18 @@ async def get_stats():
         device_identifiers = dict(stats["device_identifiers"])
         last_heartbeat = stats["last_heartbeat"]
         last_command = stats["last_command"]
+        last_command_echo = stats["last_command_echo"]
     
     return {
         "statistics": {
             "heartbeat_received": stats["heartbeat_received"],
+            "command_echo_received": stats["command_echo_received"],
             "commands_sent": stats["commands_sent"],
             "active_connections": active_count,
             "device_identifiers": device_identifiers,
             "last_heartbeat": last_heartbeat,
-            "last_command": last_command
+            "last_command": last_command,
+            "last_command_echo": last_command_echo
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -642,11 +686,7 @@ async def disconnect_client(client_id: str):
         
         device_identifier = active_clients[client_id].get("device_identifier")
         del active_clients[client_id]
-        if (
-            device_identifier and
-            stats["device_identifiers"].get(device_identifier, {}).get("client_id") == client_id
-        ):
-            del stats["device_identifiers"][device_identifier]
+        remove_device_identifier_mapping(device_identifier, client_id)
         stats["active_connections"] = len(active_clients)
     
     logger.info(f"强制断开设备: {client_id}")
