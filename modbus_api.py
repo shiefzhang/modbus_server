@@ -10,7 +10,10 @@ import socket
 import threading
 import struct
 import logging
-from fastapi import FastAPI, HTTPException
+import os
+from collections import deque
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime
 import uvicorn
@@ -30,6 +33,11 @@ MODBUS_PORT = 10015
 
 FASTAPI_HOST = '0.0.0.0'
 FASTAPI_PORT = 8288
+
+MAX_ACTIVE_CLIENTS = int(os.getenv("MODBUS_MAX_ACTIVE_CLIENTS", "20"))
+MAX_LOG_HEX_CHARS = int(os.getenv("MODBUS_MAX_LOG_HEX_CHARS", "128"))
+API_RATE_LIMIT_REQUESTS = int(os.getenv("MODBUS_API_RATE_LIMIT_REQUESTS", "60"))
+API_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("MODBUS_API_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 # Modbus 命令帧定义
 MODBUS_COMMANDS = {
@@ -83,6 +91,8 @@ MODBUS_COMMANDS = {
 # 存储所有活动的客户端连接
 active_clients: Dict[str, dict] = {}
 clients_lock = threading.Lock()
+rate_limit_lock = threading.Lock()
+rate_limit_hits: Dict[str, deque] = {}
 
 # 统计信息
 stats = {
@@ -95,6 +105,13 @@ stats = {
 }
 
 # ============ Modbus 工具函数 ============
+def truncate_hex(data: bytes, max_chars: int = MAX_LOG_HEX_CHARS) -> str:
+    """返回适合日志输出的十六进制字符串，避免大包刷爆日志。"""
+    data_hex = data.hex().upper()
+    if len(data_hex) <= max_chars:
+        return data_hex
+    return f"{data_hex[:max_chars]}...({len(data)} bytes)"
+
 def calculate_crc16(data: bytes) -> int:
     """计算 Modbus CRC16"""
     crc = 0xFFFF
@@ -156,7 +173,7 @@ def send_command_to_client(client_socket: socket.socket, command: int, client_id
             client_socket.settimeout(2)
             response = client_socket.recv(1024)
             if response:
-                logger.info(f"收到命令响应: {response.hex().upper()}")
+                logger.info(f"收到命令响应: {truncate_hex(response)}")
         except socket.timeout:
             logger.info("命令发送后无响应（超时）")
         except Exception as e:
@@ -269,10 +286,19 @@ class ModbusHeartbeatServer:
                     if not data:
                         break
                     
+                    data_hex = truncate_hex(data)
+                    logger.info(f"💓 收到心跳 [{client_id}]: {data_hex}")
+
+                    if not validate_modbus_frame(data):
+                        logger.warning(f"   CRC 校验: ❌ 失败，已忽略本次心跳")
+                        continue
+
+                    logger.info(f"   CRC 校验: ✅ 通过")
+
                     heartbeat_time = datetime.now().isoformat()
                     device_identifier = extract_device_identifier(data)
 
-                    # 更新心跳统计
+                    # 只统计通过 CRC 校验的心跳，避免伪造帧更新在线设备状态。
                     with clients_lock:
                         if client_id in active_clients:
                             active_clients[client_id]["last_heartbeat"] = heartbeat_time
@@ -282,7 +308,7 @@ class ModbusHeartbeatServer:
                         stats["heartbeat_received"] += 1
                         stats["last_heartbeat"] = {
                             "time": heartbeat_time,
-                            "data": data.hex().upper(),
+                            "data": data_hex,
                             "client_id": client_id,
                             "device_identifier": device_identifier,
                             "from": f"{client_address[0]}:{client_address[1]}"
@@ -294,15 +320,7 @@ class ModbusHeartbeatServer:
                                 "last_heartbeat": heartbeat_time,
                                 "from": f"{client_address[0]}:{client_address[1]}"
                             }
-                    
-                    logger.info(f"💓 收到心跳 [{client_id}][{device_identifier}]: {data.hex().upper()}")
-                    
-                    # 验证 CRC（仅记录）
-                    if validate_modbus_frame(data):
-                        logger.info(f"   CRC 校验: ✅ 通过")
-                    else:
-                        logger.warning(f"   CRC 校验: ❌ 失败")
-                    
+
                     # ⚠️ 关键：不发送任何回复
                     # 保持连接打开，等待后续命令
                     
@@ -347,6 +365,15 @@ class ModbusHeartbeatServer:
                 try:
                     client_socket, client_address = self.server_socket.accept()
                     client_socket.settimeout(60)
+
+                    with clients_lock:
+                        active_count = len(active_clients)
+                    if active_count >= MAX_ACTIVE_CLIENTS:
+                        logger.warning(
+                            f"拒绝设备连接 {client_address}: 当前连接数 {active_count} 已达到上限 {MAX_ACTIVE_CLIENTS}"
+                        )
+                        client_socket.close()
+                        continue
                     
                     # 生成唯一客户端 ID
                     client_id_counter += 1
@@ -397,6 +424,34 @@ class CommandRequest(BaseModel):
     """命令请求模型"""
     command: int  # 1 或 2
     client_id: Optional[str] = None  # 可选的客户端ID，不指定则发送给最近收到心跳的设备
+
+@app.middleware("http")
+async def rate_limit_api_requests(request: Request, call_next):
+    client_host = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window_start = now - API_RATE_LIMIT_WINDOW_SECONDS
+
+    with rate_limit_lock:
+        hits = rate_limit_hits.setdefault(client_host, deque())
+        while hits and hits[0] < window_start:
+            hits.popleft()
+
+        if len(hits) >= API_RATE_LIMIT_REQUESTS:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "请求过于频繁，请稍后再试"}
+            )
+
+        hits.append(now)
+
+        for host in list(rate_limit_hits.keys()):
+            host_hits = rate_limit_hits[host]
+            while host_hits and host_hits[0] < window_start:
+                host_hits.popleft()
+            if not host_hits:
+                del rate_limit_hits[host]
+
+    return await call_next(request)
 
 @app.get("/")
 async def root():
